@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: trading-bot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MONGO_URI
+        value: ""  # Leave blank for local fallback or provide your Atlas URI here in the Render dashboard
+      - key: MONGO_DB_NAME
+        value: "trading_bot"
+      - key: UPSTOX_LIVE_API_KEY
+        value: "" # Add in Render dashboard
+      - key: UPSTOX_LIVE_SECRET
+        value: "" # Add in Render dashboard
+      - key: UPSTOX_REDIRECT_URI
+        value: "" # Ensure this matches your Render app URL when generated, e.g. https://your-app.onrender.com
