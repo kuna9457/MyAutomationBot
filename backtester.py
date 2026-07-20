@@ -8,8 +8,12 @@ Total Return, Max Drawdown, Sharpe, Calmar, Win Rate, plus an equity curve for
 the UI chart.
 
 Historical data source, in priority order:
-  1. yfinance (if installed and a mappable ticker is given)
-  2. synthetic random-walk series (always available — lets the engine be tested)
+  1. real Upstox candles (needs an instrument key + token) — the good path
+  2. yfinance (if installed and a mappable ticker is given)
+  3. synthetic random-walk series, seeded per ticker (always available)
+
+Timeframe follows the mode: Swing = daily, Intraday = 15m, Scalper = 1m.
+Longs and shorts are both simulated; the Scalper is two-sided.
 """
 from __future__ import annotations
 
@@ -20,10 +24,15 @@ import numpy as np
 import pandas as pd
 
 from config import Mode, params_for_mode
-from strategy import (enrich, intraday_signal, position_size, swing_signal)
+from strategy import enrich, position_size, resolve_strategy
 
 
 TRADING_DAYS = 252
+
+# Bars per year, per timeframe — used to annualise Sharpe and the Calmar CAGR.
+# Equity: ~6.25h/day => 25 fifteen-minute bars, 375 one-minute bars.
+BARS_PER_YEAR = {"1d": TRADING_DAYS, "15m": TRADING_DAYS * 25,
+                 "1m": TRADING_DAYS * 375}
 
 
 @dataclass
@@ -40,10 +49,59 @@ def _yf_symbol(ticker: str) -> str:
     """Map our symbols to yfinance tickers where a sensible mapping exists."""
     mapping = {
         "GOLD": "GC=F", "CRUDEOIL": "CL=F", "NATURALGAS": "NG=F", "SILVER": "SI=F",
+        # MCX mini/micro contracts track the SAME underlying spot price as their
+        # full-size sibling — only the contract size (and therefore margin) differs,
+        # not the price series — so they map to the identical Yahoo futures ticker.
+        "GOLDM": "GC=F", "CRUDEOILM": "CL=F", "NATGASMINI": "NG=F",
+        "SILVERM": "SI=F", "SILVERMIC": "SI=F",
     }
     if ticker in mapping:
         return mapping[ticker]
     return ticker if ticker.endswith(".NS") else f"{ticker}.NS"
+
+
+# Upstox serves at most ~1 month of 1-minute history per request; a wider window
+# throws ApiException. Daily has no such limit. So 1-minute ranges are fetched in
+# sub-month chunks and stitched — WITHOUT this, any intraday/scalper backtest
+# longer than a month silently fell through to synthetic data (the bug that made
+# backtest trade prices not match the real instrument).
+_MINUTE_CHUNK_DAYS = 25
+
+
+def _fetch_upstox_candles_raw(hist_api, instrument_key: str, up_interval: str,
+                              start: str, end: str) -> list:
+    """Raw Upstox candle lists over [start, end]. 'day' is one call (spans years);
+    '1minute' is walked backwards in <=_MINUTE_CHUNK_DAYS windows and concatenated,
+    because Upstox caps a single 1-minute request at roughly one month. Overlaps
+    are harmless — the caller de-duplicates by timestamp."""
+    if up_interval == "day":
+        resp = hist_api.get_historical_candle_data1(
+            instrument_key, up_interval, end, start, api_version="v2")
+        return resp.data.candles or []
+
+    start_dt = datetime.strptime(start, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end, "%Y-%m-%d").date()
+    candles: list = []
+    ok_chunks = errors = 0
+    cur = end_dt
+    while cur >= start_dt:
+        chunk_from = max(start_dt, cur - timedelta(days=_MINUTE_CHUNK_DAYS))
+        try:
+            resp = hist_api.get_historical_candle_data1(
+                instrument_key, up_interval, str(cur), str(chunk_from),
+                api_version="v2")
+            candles += (resp.data.candles or [])
+            ok_chunks += 1
+        except Exception as exc:
+            # One bad month must not sink the whole fetch — a partial real series
+            # is still real. Only a total wipe-out falls back to synthetic.
+            errors += 1
+            print(f"[backtester] 1-min chunk {chunk_from}->{cur} failed: {exc}")
+        cur = chunk_from - timedelta(days=1)
+    if errors:
+        print(f"[backtester] 1-min fetch: {ok_chunks} chunk(s) OK, "
+              f"{errors} failed.")
+    return candles
 
 
 def _fetch_upstox_hist(
@@ -56,9 +114,8 @@ def _fetch_upstox_hist(
     cfg.access_token = token
     hist = upstox_client.HistoryApi(upstox_client.ApiClient(cfg))
     up_interval = "day" if interval == "1d" else "1minute"
-    resp = hist.get_historical_candle_data1(
-        instrument_key, up_interval, end, start, api_version="v2")
-    candles = resp.data.candles
+    candles = _fetch_upstox_candles_raw(hist, instrument_key, up_interval,
+                                        start, end)
     if not candles:
         return pd.DataFrame()
     df = pd.DataFrame(candles, columns=[
@@ -68,7 +125,9 @@ def _fetch_upstox_hist(
     df = (df.set_index("ts").sort_index()
           [["open", "high", "low", "close", "volume"]].astype(float))
     df = df[~df.index.duplicated(keep="last")]
-    if interval != "1d":
+    # Only 15m needs building; "1m" is already what Upstox returned, and
+    # resampling it to 15min would silently backtest the wrong timeframe.
+    if interval == "15m":
         df = df.resample("15min").agg(
             {"open": "first", "high": "max", "low": "min",
              "close": "last", "volume": "sum"}).dropna()
@@ -78,7 +137,10 @@ def _fetch_upstox_hist(
 def fetch_history(
     ticker: str, start: str, end: str, interval: str = "1d",
     instrument_key: str = "", token: str = "",
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, str]:
+    """Return (candles, source). `source` is one of "upstox", "yfinance" or
+    "synthetic" so callers can tell REAL market data from a synthetic random walk
+    and warn the user instead of presenting fake trade prices as genuine."""
     # 1) REAL Upstox historical data — the good path. Ticker-specific & real, so
     #    every instrument gives genuinely different results.
     if instrument_key and token:
@@ -86,7 +148,7 @@ def fetch_history(
             df = _fetch_upstox_hist(instrument_key, start, end, interval, token)
             if len(df) > 30:
                 print(f"[backtester] {ticker}: {len(df)} real Upstox candles.")
-                return df
+                return df, "upstox"
             print(f"[backtester] {ticker}: Upstox returned too few candles "
                   f"({len(df)}); trying next source.")
         except Exception as exc:
@@ -102,18 +164,18 @@ def fetch_history(
         if df is not None and not df.empty:
             df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
             df.index = pd.to_datetime(df.index)
-            return df.dropna()
+            return df.dropna(), "yfinance"
     except Exception as exc:
         print(f"[backtester] yfinance unavailable ({exc}); using synthetic data.")
 
     # 3) Synthetic — seeded PER TICKER so different symbols give different series
     #    (a fixed seed made every backtest identical — the bug being fixed here).
-    return synthetic_history(start, end, interval, seed_key=ticker)
+    return synthetic_history(start, end, interval, seed_key=ticker), "synthetic"
 
 
 def synthetic_history(start: str, end: str, interval: str = "1d",
                       seed_key: str = "") -> pd.DataFrame:
-    freq = "1D" if interval == "1d" else "15min"
+    freq = {"1d": "1D", "15m": "15min", "1m": "1min"}.get(interval, "15min")
     idx = pd.date_range(start=start, end=end, freq=freq)
     if len(idx) < 50:
         idx = pd.date_range(end=datetime.now(), periods=400, freq=freq)
@@ -121,7 +183,7 @@ def synthetic_history(start: str, end: str, interval: str = "1d",
     # 15m range would balloon to 100k+ bars and stall the backtest for no realism.
     # Cap to the most recent slice, mirroring what a real intraday feed would give.
     MAX_INTRADAY_BARS = 6000
-    if freq == "15min" and len(idx) > MAX_INTRADAY_BARS:
+    if freq != "1D" and len(idx) > MAX_INTRADAY_BARS:
         idx = idx[-MAX_INTRADAY_BARS:]
     n = len(idx)
     # Derive the seed from the ticker so each symbol has its own price path — with a
@@ -155,29 +217,58 @@ def run_backtest(
     initial_capital: float,
     mode: Mode,
     lot_size: int = 1,
+    strategy_key: str = "",
 ) -> BacktestResult:
-    params = params_for_mode(mode)
-    interval = "1d" if mode == Mode.SWING else "15m"
+    # Same resolution the engine uses, so a backtest measures exactly the
+    # strategy the bot would trade — parameters included.
+    sd = resolve_strategy(mode, strategy_key)
+    params = sd.params
+    interval = {Mode.SWING: "1d", Mode.INTRADAY: "15m", Mode.SCALPER: "1m"}[mode]
     # Resolve the Upstox instrument key + live token so we backtest on REAL data.
     import config
     inst = config.INSTRUMENTS_BY_SYMBOL.get(ticker)
     instrument_key = inst.instrument_key if inst else ""
+    contract_multiplier = inst.contract_multiplier if inst else 1
+    session_open = (config.market_hours_for_segment(inst.segment).open_t
+                    if inst else None)
+    # Same notional cap the live engine applies, so backtest quantities are ones
+    # the account could actually have funded.
+    max_leverage = (config.max_leverage_for(inst.segment, params) if inst
+                    else params.max_leverage)
     token = config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
-    data = fetch_history(ticker, start, end, interval,
-                         instrument_key=instrument_key, token=token)
+    data, source = fetch_history(ticker, start, end, interval,
+                                 instrument_key=instrument_key, token=token)
+    if data.empty:
+        empty = pd.Series(dtype=float)
+        return BacktestResult(_metrics(empty, pd.DataFrame(), initial_capital,
+                                       interval, source), empty, pd.DataFrame())
     # Enrich ONCE up front. Indicators are causal (each row uses only past/current
     # data), so a value at row i is identical whether computed on the full series
     # or on data[:i+1]. This lets the walk-forward loop read pre-computed columns
     # instead of re-enriching a growing window every bar (which was O(n^2) and made
     # intraday backtests hang). We call the mode's signal fn directly on the slice.
     data = enrich(data, params)
-    signal_fn = swing_signal if mode == Mode.SWING else intraday_signal
+
+    def signal_fn(w):
+        # `w` is already enriched, so call the strategy fn directly — going via
+        # run_strategy would re-enrich a growing window every bar (O(n^2)).
+        return sd.fn(w, params, session_open)
 
     capital = initial_capital
     equity = []
     trades = []
-    position = None  # dict: entry, stop, target, qty
-    warmup = params.ema_trend + 2 if mode == Mode.SWING else params.macd_slow + 2
+    position = None  # dict: side, entry, stop, target, qty
+    # Bar index of the last entry/exit. The live engine refuses to re-trade a bar
+    # it has already acted on (reentry_cooldown_bars); the backtest must model the
+    # same guard or it measures a bot that doesn't exist.
+    last_action_i = None
+    if mode == Mode.SWING:
+        warmup = params.ema_trend + 2
+    elif mode == Mode.SCALPER:
+        warmup = max(params.atr_median_window, params.context_bars,
+                     params.ema_fast, params.vol_avg_period) + 2
+    else:
+        warmup = params.macd_slow + 2
 
     # The signal fns read only the last two bars (indicators are pre-computed), but
     # keep a >= warmup-sized tail so their internal length guard still passes.
@@ -185,59 +276,155 @@ def run_backtest(
     for i in range(warmup, len(data)):
         window = data.iloc[max(0, i - tail + 1): i + 1]
         bar = data.iloc[i]
-        price = float(bar["close"])
 
         # manage an open position first
         if position is not None:
-            hit_sl = bar["low"] <= position["stop"]
-            hit_tp = bar["high"] >= position["target"]
-            exit_price = None
-            if hit_sl and hit_tp:
-                exit_price = position["stop"]        # assume worst case
-            elif hit_sl:
-                exit_price = position["stop"]
+            is_long = position["side"] == "BUY"
+            # Direction-aware: a short is stopped out by a HIGH above its stop and
+            # targeted by a LOW below its target — the mirror of a long.
+            if is_long:
+                hit_sl = bar["low"] <= position["stop"]
+                hit_tp = bar["high"] >= position["target"]
+            else:
+                hit_sl = bar["high"] >= position["stop"]
+                hit_tp = bar["low"] <= position["target"]
+            exit_price, exit_reason = None, ""
+            if hit_sl:
+                exit_price, exit_reason = position["stop"], "STOP-LOSS"  # worst case when both hit
             elif hit_tp:
-                exit_price = position["target"]
+                exit_price, exit_reason = position["target"], "TARGET"
+            # Time exit (Scalper): bars_held is exact because bars are fixed-width.
+            if exit_price is None and params.max_hold_minutes > 0:
+                held_bars = i - position["bar"]
+                if held_bars >= params.max_hold_minutes:   # 1 bar == 1 minute
+                    exit_price = float(bar["close"])
+                    exit_reason = f"TIME-EXIT ({params.max_hold_minutes}m)"
             if exit_price is not None:
-                pnl = (exit_price - position["entry"]) * position["qty"]
+                direction = 1 if is_long else -1
+                pnl = ((exit_price - position["entry"]) * position["qty"]
+                       * direction * contract_multiplier)
                 capital += pnl
                 trades.append({
                     "entry_time": position["time"], "exit_time": bar.name,
+                    "side": position["side"],
                     "entry": position["entry"], "exit": exit_price,
                     "qty": position["qty"], "pnl": pnl,
                     "rr": params.risk_reward, "win": pnl > 0,
+                    # WHY the trade was taken and WHY it closed — mirrors the live
+                    # log so a backtest row explains itself, not just its numbers.
+                    "entry_reason": position["reason"], "exit_reason": exit_reason,
                 })
                 position = None
+                last_action_i = i
 
-        # look for a new entry only when flat. `window` is already enriched, so we
-        # call the signal fn directly (generate_signal would re-enrich = O(n^2)).
-        if position is None:
-            sig = signal_fn(window, params)
+        # Look for a new entry only when flat AND off cooldown. Without the
+        # cooldown an exit would be followed by re-entry into the identical setup
+        # on the very same bar.
+        cooling = (last_action_i is not None
+                   and (i - last_action_i) < params.reentry_cooldown_bars)
+        # `window` is already enriched, so we call the signal fn directly
+        # (generate_signal would re-enrich = O(n^2)).
+        if position is None and not cooling:
+            sig = signal_fn(window)
             if sig is not None:
-                qty, risk_amt = position_size(capital, sig, params, lot_size)
+                qty, risk_amt = position_size(capital, sig, params, lot_size,
+                                              contract_multiplier, max_leverage)
                 if qty > 0:
                     position = {
+                        "side": sig.side,
                         "entry": sig.entry_price, "stop": sig.stop_loss,
                         "target": sig.target, "qty": qty, "time": bar.name,
+                        "bar": i, "reason": sig.reason,
                     }
+                    last_action_i = i
 
         equity.append(capital)
 
     equity_curve = pd.Series(equity, index=data.index[warmup:])
     trades_df = pd.DataFrame(trades)
-    metrics = _metrics(equity_curve, trades_df, initial_capital, interval)
+    metrics = _metrics(equity_curve, trades_df, initial_capital, interval, source)
     return BacktestResult(metrics, equity_curve, trades_df)
+
+
+# --------------------------------------------------------------------------- #
+#  Bulk simulation — same strategy/params across a bucket of instruments
+# --------------------------------------------------------------------------- #
+def run_bulk_backtest(
+    tickers: list[str],
+    start: str,
+    end: str,
+    initial_capital: float,
+    mode: Mode,
+    strategy_key: str = "",
+    progress_cb=None,
+) -> dict[str, BacktestResult]:
+    """Run the SAME strategy with the SAME parameters over every ticker in the
+    bucket and return {ticker: BacktestResult}. Each instrument is simulated
+    independently on its own real data, starting from the identical capital, so
+    their equity curves are directly comparable in a single chart.
+
+    `progress_cb(done, total, ticker)` — optional; called after each symbol so a
+    UI can show progress. Lot size is taken per-instrument from config, the same
+    way the single-ticker path resolves it, so quantities stay realistic.
+    """
+    import config
+    results: dict[str, BacktestResult] = {}
+    total = len(tickers)
+    for i, ticker in enumerate(tickers):
+        inst = config.INSTRUMENTS_BY_SYMBOL.get(ticker)
+        lot_size = inst.lot_size if inst else 1
+        try:
+            results[ticker] = run_backtest(
+                ticker, start, end, initial_capital, mode,
+                lot_size=lot_size, strategy_key=strategy_key)
+        except Exception as exc:
+            # One bad symbol must not sink the whole bucket — record an empty
+            # result so the UI can show it failed rather than aborting the run.
+            print(f"[backtester] bulk: {ticker} failed ({exc}).")
+            empty = pd.Series(dtype=float)
+            interval = {Mode.SWING: "1d", Mode.INTRADAY: "15m",
+                        Mode.SCALPER: "1m"}[mode]
+            results[ticker] = BacktestResult(
+                _metrics(empty, pd.DataFrame(), initial_capital, interval,
+                         "error"),
+                empty, pd.DataFrame())
+        if progress_cb is not None:
+            progress_cb(i + 1, total, ticker)
+    return results
+
+
+def bulk_summary_frame(results: dict[str, BacktestResult]) -> pd.DataFrame:
+    """Flatten bulk results into one comparison table, best return first."""
+    rows = []
+    for ticker, res in results.items():
+        m = res.metrics
+        rows.append({
+            "Ticker": ticker,
+            "Total Return %": m["Total Return %"],
+            "Max Drawdown %": m["Max Drawdown %"],
+            "Sharpe": m["Sharpe"],
+            "Calmar": m["Calmar"],
+            "Win Rate %": m["Win Rate %"],
+            "Trades": m["Total Trades"],
+            "Final Equity": m["Final Equity"],
+            "Data Source": m.get("Data Source", "synthetic"),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("Total Return %", ascending=False).reset_index(drop=True)
+    return df
 
 
 # --------------------------------------------------------------------------- #
 #  Metrics
 # --------------------------------------------------------------------------- #
 def _metrics(equity: pd.Series, trades: pd.DataFrame,
-             initial_capital: float, interval: str) -> dict:
+             initial_capital: float, interval: str,
+             source: str = "synthetic") -> dict:
     if equity.empty:
         return {"Total Return %": 0.0, "Max Drawdown %": 0.0, "Sharpe": 0.0,
                 "Calmar": 0.0, "Win Rate %": 0.0, "Total Trades": 0,
-                "Final Equity": initial_capital}
+                "Final Equity": initial_capital, "Data Source": source}
 
     total_return = (equity.iloc[-1] / initial_capital - 1) * 100
 
@@ -246,7 +433,7 @@ def _metrics(equity: pd.Series, trades: pd.DataFrame,
     max_dd = drawdown.min() * 100  # negative
 
     rets = equity.pct_change().dropna()
-    periods_per_year = TRADING_DAYS if interval == "1d" else TRADING_DAYS * 25
+    periods_per_year = BARS_PER_YEAR.get(interval, TRADING_DAYS * 25)
     if rets.std() > 0:
         sharpe = (rets.mean() / rets.std()) * np.sqrt(periods_per_year)
     else:
@@ -266,4 +453,5 @@ def _metrics(equity: pd.Series, trades: pd.DataFrame,
         "Win Rate %": round(float(win_rate), 2),
         "Total Trades": int(len(trades)),
         "Final Equity": round(float(equity.iloc[-1]), 2),
+        "Data Source": source,
     }

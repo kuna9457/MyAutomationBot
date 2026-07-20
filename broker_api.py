@@ -12,6 +12,12 @@ place/track orders without knowing which broker is behind it.
 Every broker returns the same OrderResult shape, so strategy/engine code is
 broker-agnostic (Immutable Rule #3). Real SDK calls are wrapped in try/except
 and degrade to a clear error rather than crashing the bot.
+
+LIMIT ORDERS: implemented for Simulated and Upstox. Dhan and Kotak inherit the
+BaseBroker default, which degrades a limit request to a MARKET order — correct
+but subject to slippage, which matters for the Scalper's 1:1 RR. They are left
+un-implemented rather than written blind: an untested order-placement path is a
+worse failure than a market fill, since it risks a malformed LIVE order.
 """
 from __future__ import annotations
 
@@ -22,6 +28,59 @@ from typing import Optional
 
 import config
 from config import Broker, Environment, Instrument, Segment
+
+# Upstox's real order-margin endpoint. Returns SPAN + Exposure + peak margin for a
+# basket of instruments — the ACTUAL cash the broker blocks, which for MCX futures
+# is nothing like notional ÷ leverage. Read-only, so it is safe to call with the
+# live token even from Paper mode.
+UPSTOX_MARGIN_URL = "https://api.upstox.com/v2/charges/margin"
+
+
+def fetch_upstox_margin(
+    token: str, instrument_key: str, quantity: int,
+    side: str = "BUY", product: str = "D", timeout: float = 10.0,
+) -> Optional[float]:
+    """Real margin (₹) required to trade `quantity` units of one instrument, from
+    Upstox's /charges/margin API. Returns None if it can't be determined — no
+    token, network/auth error, or an unexpected response shape — so callers can
+    fall back to an estimate. NEVER raises.
+
+    `quantity` is in the SAME units an order uses (lots × lot_size). `price` is
+    sent as 0 so Upstox margins against the live LTP; no live price is needed here.
+    `product` is "D" (delivery/NRML) for F&O/commodity, "I" (intraday/MIS) for
+    equity — margin differs between them.
+    """
+    if not token or quantity <= 0:
+        return None
+    try:
+        import requests
+        body = {"instruments": [{
+            "instrument_key": instrument_key,
+            "quantity": int(quantity),
+            "transaction_type": side,
+            "product": product,
+            "price": 0,
+        }]}
+        resp = requests.post(
+            UPSTOX_MARGIN_URL,
+            headers={"Authorization": f"Bearer {token}",
+                     "accept": "application/json",
+                     "Content-Type": "application/json"},
+            json=body, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("data", {}) or {}
+        # Upstox reports the basket total under final_margin/required_margin; fall
+        # back to summing the per-instrument legs if those aren't present.
+        for key in ("final_margin", "required_margin"):
+            val = data.get(key)
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val)
+        margins = data.get("margins") or []
+        total = sum(float(m.get("total_margin", 0) or 0) for m in margins)
+        return total if total > 0 else None
+    except Exception:
+        return None
 
 
 @dataclass
@@ -46,11 +105,34 @@ class BaseBroker:
     ) -> OrderResult:
         raise NotImplementedError
 
+    def place_limit_order(
+        self, instrument: Instrument, side: str, quantity: int,
+        limit_price: float, ref_price: float = 0.0,
+    ) -> OrderResult:
+        """Entry at a chosen price rather than whatever the book offers — the
+        Scalper uses this to sit just inside the spread (scalping.md §4), because
+        at a 1:1 RR on 1-minute bars, market-order slippage eats the edge.
+
+        Default: brokers that don't implement limits degrade to a market order so
+        no broker silently drops the order.
+        """
+        return self.place_market_order(instrument, side, quantity, ref_price)
+
+    def required_margin(
+        self, instrument: Instrument, quantity: int, side: str = "BUY",
+    ) -> Optional[float]:
+        """Real margin (₹) the broker blocks to hold `quantity` of `instrument`, or
+        None if this broker can't tell us (the caller then falls back to an
+        estimate). Only Upstox implements it today; the rest inherit None."""
+        return None
+
     def square_off(
         self, instrument: Instrument, side: str, quantity: int,
         ref_price: float = 0.0,
     ) -> OrderResult:
         # Exit is just an opposite market order; default impl flips the side.
+        # Exits stay MARKET on purpose: a stop or a time-exit must actually get
+        # out, and an unfilled limit would leave the position open past its stop.
         opposite = "SELL" if side == "BUY" else "BUY"
         return self.place_market_order(instrument, opposite, quantity, ref_price)
 
@@ -72,6 +154,20 @@ class SimulatedBroker(BaseBroker):
             filled_price=ref_price,
             quantity=quantity,
             message="Simulated fill",
+        )
+
+    def place_limit_order(self, instrument, side, quantity, limit_price,
+                          ref_price=0.0):
+        # Optimistic: assumes the limit fills at its price. Real limits inside the
+        # spread sometimes don't fill at all, so paper results here are slightly
+        # kinder than live would be.
+        return OrderResult(
+            ok=True,
+            order_id=f"SIM-{uuid.uuid4().hex[:10]}",
+            broker=self.name,
+            filled_price=limit_price or ref_price,
+            quantity=quantity,
+            message=f"Simulated LIMIT fill @ {limit_price:.2f}",
         )
 
 
@@ -112,7 +208,10 @@ class UpstoxBroker(BaseBroker):
             print(f"[UpstoxBroker] connect failed: {exc}")
             return False
 
-    def place_market_order(self, instrument, side, quantity, ref_price=0.0):
+    def _place(self, instrument, side, quantity, order_type: str,
+               price: float, ref_price: float) -> OrderResult:
+        """Shared order path. `price` is ignored by the API for MARKET orders and
+        is the limit price for LIMIT orders."""
         if self._order_api is None:
             return OrderResult(False, "", self.name, message="Not connected")
         try:
@@ -121,9 +220,9 @@ class UpstoxBroker(BaseBroker):
                 quantity=quantity,
                 product="I" if instrument.segment == Segment.EQUITY else "D",
                 validity="DAY",
-                price=0,
+                price=round(float(price), 2) if order_type == "LIMIT" else 0,
                 instrument_token=instrument.instrument_key,
-                order_type="MARKET",
+                order_type=order_type,
                 transaction_type=side,
                 disclosed_quantity=0,
                 trigger_price=0,
@@ -131,10 +230,33 @@ class UpstoxBroker(BaseBroker):
             )
             resp = self._order_api.place_order(body, api_version="v2")
             oid = getattr(getattr(resp, "data", None), "order_id", "") or "UPX"
-            return OrderResult(True, oid, self.name, ref_price, quantity,
-                               "sandbox" if self.sandbox else "live")
+            # NOTE: this reports the order as filled at the requested price. Upstox
+            # returns an order_id, not a fill — a LIMIT resting inside the spread
+            # may fill later, partially, or not at all. Polling get_order_details
+            # for the true average price is the correct next step before trusting
+            # live PnL to the rupee.
+            fill = price if order_type == "LIMIT" else ref_price
+            return OrderResult(True, oid, self.name, fill, quantity,
+                               f"{'sandbox' if self.sandbox else 'live'} {order_type}")
         except Exception as exc:
             return OrderResult(False, "", self.name, message=str(exc))
+
+    def place_market_order(self, instrument, side, quantity, ref_price=0.0):
+        return self._place(instrument, side, quantity, "MARKET", 0.0, ref_price)
+
+    def place_limit_order(self, instrument, side, quantity, limit_price,
+                          ref_price=0.0):
+        return self._place(instrument, side, quantity, "LIMIT", limit_price,
+                           ref_price)
+
+    def required_margin(self, instrument, quantity, side="BUY"):
+        # Prefer the LIVE token — the margin endpoint is read-only and the live
+        # token is the one that stays valid, so this works even in Paper mode.
+        token = (config.UPSTOX_LIVE_ACCESS_TOKEN
+                 or (config.UPSTOX_SANDBOX_TOKEN if self.sandbox else ""))
+        product = "I" if instrument.segment == Segment.EQUITY else "D"
+        return fetch_upstox_margin(token, instrument.instrument_key, quantity,
+                                   side, product)
 
 
 # --------------------------------------------------------------------------- #

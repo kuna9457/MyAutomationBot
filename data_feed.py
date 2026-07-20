@@ -1,18 +1,29 @@
 """
 data_feed.py
-Market-data layer. Streams candles to the engine.
-
-Two implementations behind one interface:
+Market-data layer. Streams candles AND live quotes to the engine.
 
     MarketDataFeed (interface)
-      ├── SimulatedFeed  -> generates realistic candles (random-walk seeded from
-      │                     each instrument's reference price). Runs with zero
-      │                     credentials so opportunity detection works today.
-      └── UpstoxWebSocketFeed -> real Upstox Market Data WebSocket V3 hook.
+      ├── SimulatedFeed       -> random-walk candles. Runs with zero credentials
+      │                          so the bot always starts.
+      ├── UpstoxWebSocketFeed -> real Upstox Market Data WebSocket V3. DEFAULT.
+      └── UpstoxRestFeed      -> polled candles; opt-in fallback only.
 
-The engine only consumes get_candles(instrument) -> DataFrame, so swapping a
-real feed in later changes nothing upstream. MCX instruments flow through the
-exact same path as equity — the only difference is market hours (config).
+WEBSOCKET-FIRST CONTRACT
+------------------------
+Live state — the current price, the bid/ask, the forming candle, and therefore
+the live PnL — comes from WebSocket ticks and nothing else. REST is used for
+exactly one job: seeding and back-correcting COMPLETED historical candles, which
+is what makes indicators (VWAP, ATR, 200 EMA) valid the moment the bot starts.
+REST never touches the forming bar and never fabricates a live price.
+
+Consumers read two things:
+    get_candles(instrument) -> DataFrame   (history + the live forming bar)
+    get_quote(instrument)   -> LiveQuote   (the live tick: price, bid/ask, age)
+
+Every quote carries a `source` ("ws" / "rest" / "sim") and an `age_seconds`, so
+a stalled or degraded stream is visible rather than silently priced as live.
+MCX instruments flow through the exact same path as equity — the only difference
+is market hours (config).
 """
 from __future__ import annotations
 
@@ -20,7 +31,9 @@ import random
 import threading
 import time as _time
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -29,6 +42,42 @@ from config import Instrument, Mode, Segment
 
 
 CANDLE_COLUMNS = ["open", "high", "low", "close", "volume"]
+
+# How many candle minutes each mode trades on. The Scalper works the 1-minute
+# tape, which is why ticks (not polled candles) have to drive it.
+TF_MINUTES = {Mode.SCALPER: 1, Mode.INTRADAY: 15, Mode.SWING: 24 * 60}
+
+
+@dataclass
+class LiveQuote:
+    """One instrument's current live state — THE single source of truth for price
+    and PnL. `source` records where it came from so the UI can never silently
+    present a polled REST candle as if it were a live tick:
+
+        "ws"   -> a real WebSocket tick (the only genuinely live source)
+        "rest" -> last REST candle close, used while the socket is down
+        "sim"  -> simulated feed
+    """
+    ltp: float
+    ts: datetime                  # exchange last-trade-time, IST wall-clock
+    received_at: float            # time.monotonic() when we accepted it
+    bid: float = 0.0
+    ask: float = 0.0
+    source: str = "ws"
+
+    @property
+    def age_seconds(self) -> float:
+        """Seconds since this quote arrived. A climbing age during market hours
+        means the stream has stalled."""
+        return max(0.0, _time.monotonic() - self.received_at)
+
+    @property
+    def is_live(self) -> bool:
+        return self.source == "ws"
+
+    @property
+    def spread(self) -> float:
+        return (self.ask - self.bid) if (self.bid > 0 and self.ask > 0) else 0.0
 
 
 class MarketDataFeed:
@@ -46,6 +95,12 @@ class MarketDataFeed:
     def status(self) -> str:
         raise NotImplementedError
 
+    def get_quote(self, instrument: Instrument) -> Optional[LiveQuote]:
+        """Latest live quote, or None if nothing has arrived yet. The engine
+        prices open positions from this — never from a candle close — so live PnL
+        is WebSocket-driven end to end."""
+        return None
+
 
 # --------------------------------------------------------------------------- #
 #  Simulated feed
@@ -57,10 +112,15 @@ class SimulatedFeed(MarketDataFeed):
     bursts so the strategies actually fire from time to time.
     """
 
-    def __init__(self, tick_seconds: float = 2.0, seed_bars: int = 260):
+    def __init__(self, tick_seconds: float = 2.0, seed_bars: int = 260,
+                 mode: Mode = Mode.INTRADAY):
         self.tick_seconds = tick_seconds
         self.seed_bars = seed_bars
+        # Bar width must match the mode, or a Scalper fallback would be handed
+        # 15-minute candles and quietly trade the wrong timeframe.
+        self.tf_min = TF_MINUTES.get(mode, 15)
         self._data: dict[str, pd.DataFrame] = {}
+        self._quotes: dict[str, LiveQuote] = {}
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -68,7 +128,7 @@ class SimulatedFeed(MarketDataFeed):
     # -- history generation ------------------------------------------------- #
     def _seed(self, inst: Instrument) -> pd.DataFrame:
         price = inst.reference_price
-        rows, ts = [], datetime.now() - timedelta(minutes=15 * self.seed_bars)
+        rows = []
         drift = 0.0
         for _ in range(self.seed_bars):
             if random.random() < 0.05:                  # occasional regime change
@@ -81,8 +141,8 @@ class SimulatedFeed(MarketDataFeed):
             vol = int(abs(random.gauss(50_000, 20_000))) + 1000
             rows.append([o, hi, lo, c, vol])
             price = new
-            ts += timedelta(minutes=15)
-        idx = pd.date_range(end=datetime.now(), periods=self.seed_bars, freq="15min")
+        idx = pd.date_range(end=datetime.now(), periods=self.seed_bars,
+                            freq=f"{self.tf_min}min")
         return pd.DataFrame(rows, columns=CANDLE_COLUMNS, index=idx)
 
     def _append_tick(self, inst: Instrument) -> None:
@@ -96,9 +156,12 @@ class SimulatedFeed(MarketDataFeed):
         lo = min(o, c) * (1 - abs(random.gauss(0, 0.0015)))
         vol = int(abs(random.gauss(60_000, 25_000))) + 1000
         row = pd.DataFrame([[o, hi, lo, c, vol]], columns=CANDLE_COLUMNS,
-                           index=[df.index[-1] + timedelta(minutes=15)])
+                           index=[df.index[-1] + timedelta(minutes=self.tf_min)])
         with self._lock:
             self._data[inst.symbol] = pd.concat([df, row]).tail(600)
+            self._quotes[inst.symbol] = LiveQuote(
+                ltp=c, ts=row.index[-1], received_at=_time.monotonic(),
+                bid=lo, ask=hi, source="sim")
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self, instruments: list[Instrument]) -> None:
@@ -125,6 +188,10 @@ class SimulatedFeed(MarketDataFeed):
             df = self._data.get(instrument.symbol)
             return df.tail(lookback).copy() if df is not None else pd.DataFrame(
                 columns=CANDLE_COLUMNS)
+
+    def get_quote(self, instrument: Instrument) -> Optional[LiveQuote]:
+        with self._lock:
+            return self._quotes.get(instrument.symbol)
 
     def status(self) -> str:
         return "🟢 Simulated feed streaming" if self._running else "🔴 Stopped"
@@ -173,6 +240,7 @@ def _fetch_rest_candles(hist_api, inst: Instrument, mode: Mode,
         df = df.resample("15min").agg(
             {"open": "first", "high": "max", "low": "min",
              "close": "last", "volume": "sum"}).dropna()
+    # SCALPER keeps the raw 1-minute bars Upstox already returns — no resample.
     return df.tail(600)
 
 
@@ -189,18 +257,23 @@ def _fetch_rest_candles(hist_api, inst: Instrument, mode: Mode,
 # --------------------------------------------------------------------------- #
 class UpstoxWebSocketFeed(MarketDataFeed):
     def __init__(self, access_token: str, mode: Mode,
-                 reseed_seconds: float = 120.0, history_days: int = 5):
+                 reseed_seconds: float = 120.0, history_days: int = 0):
         self.access_token = access_token
         self.mode = mode
-        self.tf_min = 15 if mode == Mode.INTRADAY else 24 * 60
+        self.tf_min = TF_MINUTES.get(mode, 15)
         self.reseed_seconds = reseed_seconds
-        self.history_days = history_days if mode == Mode.INTRADAY else 1100
+        # Seed depth per mode. Swing needs 200+ DAILY bars for the 200 EMA; the
+        # Scalper needs only a couple of sessions of 1-minute bars (asking for
+        # years of minutes would be a huge request the API would refuse).
+        default_days = {Mode.SWING: 1100, Mode.INTRADAY: 5, Mode.SCALPER: 3}
+        self.history_days = history_days or default_days.get(mode, 5)
 
         self._hist_api = None
         self._streamer = None
         self._key_to_symbol: dict[str, str] = {}
         self._seed: dict[str, pd.DataFrame] = {}        # completed candles
         self._forming: dict[str, dict] = {}            # symbol -> live candle
+        self._quotes: dict[str, LiveQuote] = {}        # symbol -> live tick state
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -278,7 +351,7 @@ class UpstoxWebSocketFeed(MarketDataFeed):
         self._thread.start()
 
     def _maintain_loop(self) -> None:
-        """Periodically re-seed completed candles (corrects tick drift) and, in
+        """Periodically re-seed COMPLETED candles (corrects tick drift) and, in
         degraded mode, act as a plain REST poller so data still flows. Uses a
         short base sleep so it reacts quickly when the WebSocket drops."""
         last_reseed = 0.0
@@ -297,11 +370,27 @@ class UpstoxWebSocketFeed(MarketDataFeed):
                     if df.empty:
                         continue
                     with self._lock:
+                        # The WebSocket owns the live bar. Drop any REST row at or
+                        # after the forming bucket so a lagging poll can never
+                        # overwrite fresher tick data — REST corrects history only.
+                        f = self._forming.get(inst.symbol)
+                        if f is not None:
+                            df = df[df.index < f["ts"]]
+                        if df.empty:
+                            continue
                         base = self._seed.get(inst.symbol)
                         merged = (df if base is None else
                                   pd.concat([base, df]))
                         merged = merged[~merged.index.duplicated(keep="last")]
                         self._seed[inst.symbol] = merged.sort_index().tail(600)
+                        # While the socket is down there are no ticks, so publish a
+                        # REST-derived quote — tagged "rest" so the UI and the
+                        # engine can tell it apart from a real tick.
+                        if self._degraded:
+                            self._quotes[inst.symbol] = LiveQuote(
+                                ltp=float(merged["close"].iloc[-1]),
+                                ts=merged.index[-1].to_pydatetime(),
+                                received_at=_time.monotonic(), source="rest")
                 except Exception:
                     pass
 
@@ -319,6 +408,20 @@ class UpstoxWebSocketFeed(MarketDataFeed):
         # Fall back to REST polling until it reconnects.
         self._degraded = True
 
+    @staticmethod
+    def _best_bid_ask(market_ff: dict) -> tuple[float, float]:
+        """Best bid/ask from level-1 of the depth ladder. Protobuf path:
+        fullFeed.marketFF.marketLevel.bidAskQuote[0] -> {bidP, bidQ, askP, askQ}.
+        MessageToDict omits zero-valued fields, hence the .get defaults."""
+        quotes = (market_ff.get("marketLevel", {}) or {}).get("bidAskQuote") or []
+        if not quotes:
+            return 0.0, 0.0
+        top = quotes[0] or {}
+        try:
+            return float(top.get("bidP", 0.0) or 0.0), float(top.get("askP", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+
     def _on_message(self, message) -> None:
         if not isinstance(message, dict):
             return
@@ -335,17 +438,34 @@ class UpstoxWebSocketFeed(MarketDataFeed):
             ts = (self._to_ist(ltpc["ltt"]) if ltpc.get("ltt")
                   else pd.Timestamp(datetime.now()))
             vtt = ff.get("vtt")
+            bid, ask = self._best_bid_ask(ff)
             try:
                 self._apply_tick(sym, float(ltp), ts,
-                                 float(vtt) if vtt is not None else None)
+                                 float(vtt) if vtt is not None else None,
+                                 bid, ask)
             except Exception as exc:
                 print(f"[UpstoxWebSocketFeed] tick apply error {sym}: {exc}")
 
     def _apply_tick(self, sym: str, ltp: float, ts: pd.Timestamp,
-                    vtt: float | None) -> None:
+                    vtt: float | None, bid: float = 0.0,
+                    ask: float = 0.0) -> None:
         b = self._bucket(ts)
         with self._lock:
             self._tick_count += 1
+            # Not every tick carries the depth ladder — a trade-only update has an
+            # ltpc and no marketLevel. Carry the last known bid/ask forward instead
+            # of zeroing it, or the spread appears unknown at random and limit
+            # entries silently degrade to market orders.
+            prev = self._quotes.get(sym)
+            if prev is not None:
+                bid = bid or prev.bid
+                ask = ask or prev.ask
+            # The quote is the live source of truth for price/PnL — publish it
+            # before any candle bookkeeping so a bad bucket can't withhold it.
+            self._quotes[sym] = LiveQuote(
+                ltp=ltp, ts=pd.Timestamp(ts), received_at=_time.monotonic(),
+                bid=bid, ask=ask, source="ws")
+
             f = self._forming.get(sym)
             if f is None or b > f["ts"]:
                 if f is not None:
@@ -386,6 +506,14 @@ class UpstoxWebSocketFeed(MarketDataFeed):
                 base = pd.concat([base, row]).sort_index()
         return base.tail(lookback).copy()
 
+    def get_quote(self, instrument: Instrument) -> Optional[LiveQuote]:
+        with self._lock:
+            return self._quotes.get(instrument.symbol)
+
+    @property
+    def tick_count(self) -> int:
+        return self._tick_count
+
     def stop(self) -> None:
         self._running = False
         try:
@@ -399,7 +527,12 @@ class UpstoxWebSocketFeed(MarketDataFeed):
             return "🔴 Disconnected"
         if self._ws_connected:
             return f"🟢 Upstox WebSocket V3 (live ticks: {self._tick_count})"
-        return "🟡 Upstox REST fallback (WebSocket down — refresh token?)"
+        if self._degraded:
+            return "🟡 Upstox REST fallback (WebSocket down — refresh token?)"
+        # connect() is non-blocking, so there is a brief window after start()
+        # where the socket is simply still opening. Saying "down — refresh token?"
+        # here would send you chasing a token problem that doesn't exist.
+        return "🟡 Connecting to Upstox WebSocket…"
 
 
 # --------------------------------------------------------------------------- #
@@ -412,14 +545,19 @@ class UpstoxWebSocketFeed(MarketDataFeed):
 # --------------------------------------------------------------------------- #
 class UpstoxRestFeed(MarketDataFeed):
     def __init__(self, access_token: str, mode: Mode,
-                 refresh_seconds: float = 30.0, history_days: int = 10):
+                 refresh_seconds: float = 0.0, history_days: int = 0):
         self.access_token = access_token
         self.mode = mode
-        self.refresh_seconds = refresh_seconds if mode == Mode.INTRADAY else 300.0
-        # Swing needs 200+ daily bars for the 200 EMA, so pull ~3 years of days.
-        self.history_days = history_days if mode == Mode.INTRADAY else 1100
+        # Swing needs 200+ daily bars for the 200 EMA (~3 years); the Scalper
+        # needs a couple of sessions of minutes and a fast refresh.
+        default_refresh = {Mode.SWING: 300.0, Mode.INTRADAY: 30.0,
+                           Mode.SCALPER: 10.0}
+        default_days = {Mode.SWING: 1100, Mode.INTRADAY: 10, Mode.SCALPER: 3}
+        self.refresh_seconds = refresh_seconds or default_refresh.get(mode, 30.0)
+        self.history_days = history_days or default_days.get(mode, 10)
         self._hist_api = None
         self._data: dict[str, pd.DataFrame] = {}
+        self._quotes: dict[str, LiveQuote] = {}
         self._instruments: list[Instrument] = []
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -430,6 +568,16 @@ class UpstoxRestFeed(MarketDataFeed):
         """Pull real candles for one instrument (delegates to the shared helper)."""
         return _fetch_rest_candles(self._hist_api, inst, self.mode,
                                    self.history_days)
+
+    def _store(self, inst: Instrument, df: pd.DataFrame) -> None:
+        """Cache candles and publish the derived quote. Tagged "rest", never
+        "ws" — this feed polls, so its price is by definition not a live tick."""
+        with self._lock:
+            self._data[inst.symbol] = df
+            self._quotes[inst.symbol] = LiveQuote(
+                ltp=float(df["close"].iloc[-1]),
+                ts=df.index[-1].to_pydatetime(),
+                received_at=_time.monotonic(), source="rest")
 
     def start(self, instruments: list[Instrument]) -> None:
         import upstox_client  # type: ignore
@@ -443,8 +591,7 @@ class UpstoxRestFeed(MarketDataFeed):
             try:
                 df = self._fetch(inst)
                 if not df.empty:
-                    with self._lock:
-                        self._data[inst.symbol] = df
+                    self._store(inst, df)
                     ok += 1
             except Exception as exc:
                 print(f"[UpstoxRestFeed] {inst.symbol} fetch failed: {exc}")
@@ -465,8 +612,7 @@ class UpstoxRestFeed(MarketDataFeed):
                 try:
                     df = self._fetch(inst)
                     if not df.empty:
-                        with self._lock:
-                            self._data[inst.symbol] = df
+                        self._store(inst, df)
                 except Exception:
                     pass
             _time.sleep(self.refresh_seconds)
@@ -480,9 +626,13 @@ class UpstoxRestFeed(MarketDataFeed):
             return df.tail(lookback).copy() if df is not None else pd.DataFrame(
                 columns=CANDLE_COLUMNS)
 
+    def get_quote(self, instrument: Instrument) -> Optional[LiveQuote]:
+        with self._lock:
+            return self._quotes.get(instrument.symbol)
+
     def status(self) -> str:
-        return ("🟢 Upstox live data (REST) streaming" if self._running
-                else "🔴 Disconnected")
+        return ("🟡 Upstox live data (REST poll — not tick-by-tick)"
+                if self._running else "🔴 Disconnected")
 
 
 # --------------------------------------------------------------------------- #
@@ -509,4 +659,4 @@ def make_feed(prefer_real: bool, access_token: str = "",
             return UpstoxRestFeed(access_token, mode)
         print("[make_feed] upstox_client not installed — using Simulated feed. "
               "Run 'pip install upstox-python-sdk' for the live feed.")
-    return SimulatedFeed()
+    return SimulatedFeed(mode=mode)
