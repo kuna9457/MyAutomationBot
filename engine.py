@@ -431,16 +431,18 @@ class TradingEngine:
             deploy the whole account per the user's instruction) — the margin the
             account can actually fund is the only ceiling.
 
-        Quantity is lots × lot_size to match every downstream consumer (broker order,
-        notional, PnL) which all speak in underlying units. risk_amount mirrors
-        position_size's convention (lots × price-distance × contract_multiplier) so
-        the reported risk is comparable across segments. SL/TP price levels are the
+        Quantity is the LOT COUNT (not lots × lot_size). The broker's margin/order
+        APIs treat MCX quantity as lots (quantity=1 => one contract), and every
+        downstream consumer — margin, notional, PnL — multiplies by
+        contract_multiplier, which is the per-lot point value. So one lot of
+        CRUDEOILM is quantity=1 needing ~₹24.75k, never ₹247k. risk_amount is
+        lots × price-distance × contract_multiplier. SL/TP price levels are the
         strategy's — this method only decides HOW MANY, never WHERE."""
         lots = self.mcx_lots.get(inst.symbol, 1)
         if lots <= 0:
             return 0, 0.0, (f"{inst.symbol}: signal skipped — 0 lots configured "
                             f"for this commodity (set lots in MCX settings).")
-        qty = lots * max(inst.lot_size, 1)
+        qty = lots                           # quantity is a lot count
         mult = max(inst.contract_multiplier, 1)
         per_unit = abs(sig.entry_price - sig.stop_loss)
         risk_amt = lots * per_unit * mult
@@ -469,7 +471,8 @@ class TradingEngine:
           PAPER:  "hardcoded" table  ->  "notional" (last resort)
           LIVE:   "broker" API  ->  "upstox" direct call  ->  "hardcoded"  ->  "notional"
 
-        `qty` is lots × lot_size, so lots = qty / lot_size recovers the lot count.
+        `qty` is the LOT COUNT, so margin = per_lot × qty directly (and the live
+        Upstox API, which also counts lots, gets the right quantity).
         Cached per (symbol, qty, side) so the API is hit at most once per size."""
         key = (inst.symbol, int(qty), side)
         if key in self._mcx_margin_cache:
@@ -491,8 +494,7 @@ class TradingEngine:
         if margin <= 0:
             per_lot = config.mcx_margin_per_lot(inst.symbol)
             if per_lot > 0:
-                lots = qty / max(inst.lot_size, 1)
-                margin, src = per_lot * lots, "hardcoded"
+                margin, src = per_lot * qty, "hardcoded"   # qty is the lot count
         if margin <= 0:                      # nothing else worked — rough estimate
             lev = config.max_leverage_for(inst.segment, self.params)
             notional = inst.reference_price * qty * max(inst.contract_multiplier, 1)

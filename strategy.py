@@ -724,13 +724,19 @@ def position_size(
         qty_by_capital = (cap_base * cap_pct) / (signal.entry_price * mult)
         raw_qty = min(raw_qty, qty_by_capital)
 
-    if lot_size > 1:
-        lots = int(raw_qty)
-        qty = lots * lot_size
-    else:
-        qty = int(raw_qty)
-
-    realized_risk = (qty / max(lot_size, 1)) * rupees_per_unit
+    # raw_qty is ALREADY a lot count: every limit above divides the rupee budget by
+    # (price|risk × contract_multiplier), and contract_multiplier is the PER-LOT
+    # point value (₹ per ₹1 move for one whole contract), so the quotient counts
+    # LOTS — for equity that is shares, since its multiplier and lot_size are 1.
+    #
+    # We deliberately do NOT multiply by lot_size. `quantity` is carried as a lot
+    # count everywhere downstream (broker order, margin, notional, PnL) because the
+    # broker's own margin/order APIs treat MCX quantity that way (quantity=1 => one
+    # lot). Multiplying by lot_size here — with contract_multiplier ALSO applied
+    # downstream — double-counted contract size and inflated PnL/notional/risk by
+    # lot_size for every contract whose lot_size != 1.
+    qty = int(raw_qty)                       # whole lots (equity: whole shares)
+    realized_risk = qty * rupees_per_unit
     return max(qty, 0), realized_risk
 
 

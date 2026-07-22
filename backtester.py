@@ -17,13 +17,13 @@ Longs and shorts are both simulated; the Scalper is two-sided.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 
-from config import Mode, params_for_mode
+from config import Mode, Segment, params_for_mode
 from strategy import enrich, position_size, resolve_strategy
 
 
@@ -235,6 +235,25 @@ def run_backtest(
     # the account could actually have funded.
     max_leverage = (config.max_leverage_for(inst.segment, params) if inst
                     else params.max_leverage)
+    # BACKTEST-ONLY sizing: a stock backtest deploys the FULL capital field per
+    # position — the 20%-per-trade cap (params.max_capital_per_trade_pct) is
+    # DROPPED here and ONLY here. That cap is a LIVE risk control: it forces
+    # diversification across ~5 names so no single position dominates the real
+    # account. A single-instrument backtest is measuring the strategy's edge on
+    # ALL the capital, so the cap would artificially shrink every position (and
+    # the returns) instead. The notional/leverage cap still stands (equity = 1x =
+    # exactly "all the capital"), and risk-% sizing is unchanged. Live/paper
+    # (engine.py) are untouched and keep the 20% cap.
+    size_params = replace(params, max_capital_per_trade_pct=0.0)
+    # MCX commodities are NOT risk-sized like equity. The live engine trades a
+    # FIXED number of lots (engine._mcx_fixed_size) and only checks that the
+    # account can fund the margin — no risk-%, no 20%-of-account cap. The backtest
+    # must mirror that, otherwise position_size floors a commodity to 0 lots (one
+    # CRUDEOIL lot's ~₹7.5L notional busts the leverage/capital caps) and the
+    # backtest silently takes NO trades — the "no result" bug for MCX symbols.
+    is_mcx = inst is not None and inst.segment == Segment.MCX
+    mcx_lots_per_trade = 1                       # same default as the live engine
+    mcx_margin_per_lot = config.mcx_margin_per_lot(ticker) if is_mcx else 0.0
     token = config.UPSTOX_LIVE_ACCESS_TOKEN or config.UPSTOX_SANDBOX_TOKEN
     data, source = fetch_history(ticker, start, end, interval,
                                  instrument_key=instrument_key, token=token)
@@ -327,8 +346,25 @@ def run_backtest(
         if position is None and not cooling:
             sig = signal_fn(window)
             if sig is not None:
-                qty, risk_amt = position_size(capital, sig, params, lot_size,
-                                              contract_multiplier, max_leverage)
+                if is_mcx:
+                    # Fixed-lot commodity sizing (mirrors engine._mcx_fixed_size):
+                    # trade a set number of lots as long as the account can fund the
+                    # per-lot margin. qty is a LOT COUNT; PnL below multiplies by
+                    # contract_multiplier (the per-lot point value).
+                    margin_needed = mcx_margin_per_lot * mcx_lots_per_trade
+                    if 0 < margin_needed <= capital:
+                        qty = mcx_lots_per_trade
+                        risk_amt = (mcx_lots_per_trade
+                                    * abs(sig.entry_price - sig.stop_loss)
+                                    * contract_multiplier)
+                    else:
+                        qty, risk_amt = 0, 0.0
+                else:
+                    # size_params drops the 20% per-trade cap for the backtest
+                    # (see its definition above); every other risk input is params'.
+                    qty, risk_amt = position_size(capital, sig, size_params,
+                                                  lot_size, contract_multiplier,
+                                                  max_leverage)
                 if qty > 0:
                     position = {
                         "side": sig.side,

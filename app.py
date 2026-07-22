@@ -169,26 +169,28 @@ mcx_lots: dict[str, int] = {}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _mcx_margin_preview(instrument_key: str, symbol: str, qty: int,
-                        lot_size: int, ref_price: float, mult: int,
+def _mcx_margin_preview(instrument_key: str, symbol: str, lots: int,
+                        ref_price: float, mult: int,
                         token: str, is_paper: bool) -> tuple[float, str]:
     """Margin (₹) for the sidebar preview, cached for 5 min so the auto-refreshing
     UI doesn't hammer the margin API. Mirrors engine._mcx_margin exactly:
       PAPER: hardcoded per-lot table (config.MCX_MARGIN_PER_LOT) → notional
       LIVE:  live Upstox fetch → hardcoded table → notional÷leverage
-    `token`/`is_paper` are in the cache key so switching either re-computes."""
-    if qty <= 0:
+    `lots` is the LOT COUNT (Upstox counts MCX quantity in lots), so margin is
+    per_lot × lots. `token`/`is_paper` are in the cache key so switching either
+    re-computes."""
+    if lots <= 0:
         return 0.0, "none"
     # PAPER never calls the live API — it uses the hardcoded broker-side figures.
     if not is_paper:
-        m = broker_api.fetch_upstox_margin(token, instrument_key, qty, "BUY", "D")
+        m = broker_api.fetch_upstox_margin(token, instrument_key, lots, "BUY", "D")
         if m and m > 0:
             return float(m), "live"
     per_lot = config.mcx_margin_per_lot(symbol)
     if per_lot > 0:
-        return per_lot * (qty / max(lot_size, 1)), "hardcoded"
+        return per_lot * lots, "hardcoded"
     lev = config.SEGMENT_MAX_LEVERAGE.get(Segment.MCX, 1.0)
-    notional = ref_price * qty * mult
+    notional = ref_price * lots * mult
     return (notional / lev if lev > 0 else notional), "notional"
 
 
@@ -200,8 +202,9 @@ if mcx_selected:
     with st.sidebar.expander("🛢️ MCX Commodity Settings", expanded=True):
         st.caption(
             "Commodities trade a **fixed number of lots** you set here — not "
-            "risk-based sizing. The strategy still sets SL/TP; margin is the "
-            "broker's **real** futures margin (SPAN+exposure), fetched live. "
+            "risk-based sizing. The strategy still sets SL/TP; margin is a "
+            "**fixed per-lot** broker-side figure (₹/lot × lots) in Paper mode, "
+            "and the broker's real SPAN+exposure margin in Live mode. "
             "No % cap applies — the only limit is the margin your capital can fund.")
         for inst in mcx_selected:
             lots = st.number_input(
@@ -210,9 +213,8 @@ if mcx_selected:
                 help=f"Lot size {inst.lot_size} · quoted per contract. 0 = don't "
                      f"trade this commodity.")
             mcx_lots[inst.symbol] = int(lots)
-            qty = int(lots) * inst.lot_size
             margin, src = _mcx_margin_preview(
-                inst.instrument_key, inst.symbol, qty, inst.lot_size,
+                inst.instrument_key, inst.symbol, int(lots),
                 inst.reference_price, max(inst.contract_multiplier, 1), _tok,
                 _is_paper)
             if int(lots) <= 0:
