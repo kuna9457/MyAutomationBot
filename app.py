@@ -26,6 +26,7 @@ import backtester
 import broker_api
 import strategy
 import upstox_auth
+import watchlists
 
 st.set_page_config(page_title="Algo Trading Bot", page_icon="📈", layout="wide")
 
@@ -125,31 +126,101 @@ if environment == Environment.LIVE:
                        "credentials are present in .env.")
 
 st.sidebar.markdown("### Universe")
+
+# Human-readable segment labels <-> the Segment enum, used both by the Segments
+# picker and by watchlist loading (a watchlist auto-enables the segments its
+# instruments belong to).
+_SEG_LABELS = {Segment.EQUITY: "NSE Equity", Segment.MCX: "MCX Commodity"}
+_ALL_SEG_LABELS = ["NSE Equity", "MCX Commodity"]
+_WL_NONE = "— None —"
+
+
+def _apply_live_watchlist() -> None:
+    """Callback: load the picked watchlist into the sidebar's Segments +
+    Instruments pickers. Runs BEFORE the rerun, which is the only point Streamlit
+    allows a widget's value to be set programmatically."""
+    name = st.session_state.get("live_watchlist_pick", _WL_NONE)
+    if not name or name == _WL_NONE:
+        return
+    syms = [s for s in watchlists.get(name) if s in config.INSTRUMENTS_BY_SYMBOL]
+    # Turn on whatever segments these instruments need, so none get filtered out.
+    needed = {_SEG_LABELS.get(config.INSTRUMENTS_BY_SYMBOL[s].segment) for s in syms}
+    needed.discard(None)
+    cur = set(st.session_state.get("live_segments", []))
+    st.session_state["live_segments"] = [s for s in _ALL_SEG_LABELS
+                                         if s in (cur | needed)]
+    st.session_state["live_instruments"] = syms
+
+
+def _delete_live_watchlist() -> None:
+    """Callback: delete the currently loaded watchlist and reset the picker. Must
+    run as a callback (before the rerun) — Streamlit forbids setting a widget's
+    key value once the widget has been instantiated in the same run."""
+    pick = st.session_state.get("live_watchlist_pick", _WL_NONE)
+    if pick and pick != _WL_NONE and watchlists.delete(pick):
+        st.session_state["live_watchlist_pick"] = _WL_NONE
+        st.session_state["_wl_flash"] = f"Deleted '{pick}'."
+
+
+# One-time init of the keyed pickers (see _apply_live_watchlist for why they are
+# keyed rather than using `default=`).
+if "live_segments" not in st.session_state:
+    st.session_state["live_segments"] = list(_ALL_SEG_LABELS)
+
 segments = st.sidebar.multiselect(
-    "Segments",
-    ["NSE Equity", "MCX Commodity"],
-    default=["NSE Equity", "MCX Commodity"],
-)
+    "Segments", _ALL_SEG_LABELS, key="live_segments")
+
 universe: list = []
 if "NSE Equity" in segments:
     universe += instruments_for_segment(Segment.EQUITY)
 if "MCX Commodity" in segments:
     universe += instruments_for_segment(Segment.MCX)
 
-# The equity universe is now the full Nifty 100 (~114 names). Selecting ALL of
-# them by default would subscribe 100+ live WebSocket feeds the moment the bot
-# starts, so the default is capped to a manageable slice — every instrument is
-# still selectable, and the Backtesting tab's bulk test can use the whole list.
+# The equity universe is the full Nifty 100 (~114 names). Selecting ALL of them by
+# default would subscribe 100+ live WebSocket feeds the moment the bot starts, so
+# the default is capped to a manageable slice — every instrument is still
+# selectable, and a saved Watchlist loads an exact bucket in one click.
 _DEFAULT_UNIVERSE_CAP = 15
 _universe_syms = [i.symbol for i in universe]
+if "live_instruments" not in st.session_state:
+    st.session_state["live_instruments"] = _universe_syms[:_DEFAULT_UNIVERSE_CAP]
+# Drop any selected symbol whose segment is currently unticked, BEFORE the widget
+# is created — a keyed multiselect raises if its stored value isn't in the options.
+st.session_state["live_instruments"] = [
+    s for s in st.session_state["live_instruments"] if s in _universe_syms]
+
 symbols = st.sidebar.multiselect(
-    "Instruments",
-    _universe_syms,
-    default=_universe_syms[:_DEFAULT_UNIVERSE_CAP],
+    "Instruments", _universe_syms, key="live_instruments",
     help=f"{len(_universe_syms)} instruments available (Nifty 100 + MCX). "
-         "Add or remove as you like.",
-)
+         "Add or remove as you like, or load a saved Watchlist below.")
 selected = [i for i in universe if i.symbol in symbols]
+
+# --- Watchlists: save the current bucket under a name, reload it in one click - #
+with st.sidebar.expander("📋 Watchlists", expanded=False):
+    _wl_names = watchlists.names()
+    st.selectbox(
+        "Load a watchlist", [_WL_NONE] + _wl_names,
+        key="live_watchlist_pick", on_change=_apply_live_watchlist,
+        help="Loads its instruments into the Instruments picker above and "
+             "enables the segments they need. The same watchlists appear in the "
+             "Backtesting tab's bulk test.")
+    st.caption(f"**{len(symbols)}** instrument(s) selected right now.")
+    _wl_new = st.text_input("Save current selection as", key="wl_new_name",
+                            placeholder="e.g. My Momentum Stocks")
+    _cs, _cd = st.columns(2)
+    if _cs.button("💾 Save", use_container_width=True, key="wl_save"):
+        if watchlists.save(_wl_new, symbols):
+            st.success(f"Saved '{_wl_new.strip()}' ({len(symbols)} symbols).")
+            st.rerun()
+        else:
+            st.error("Enter a name and select at least one instrument first.")
+    _pick = st.session_state.get("live_watchlist_pick", _WL_NONE)
+    _cd.button("🗑️ Delete", use_container_width=True, key="wl_delete",
+               on_click=_delete_live_watchlist,
+               disabled=(_pick == _WL_NONE or _pick not in _wl_names))
+    _flash = st.session_state.pop("_wl_flash", "")
+    if _flash:
+        st.success(_flash)
 
 capital = st.sidebar.number_input(
     "Total Capital (₹)", min_value=10_000.0, value=float(config.TOTAL_CAPITAL),
@@ -674,11 +745,40 @@ with tab_bt:
                "in the one chart (a different colour each) so you can see which "
                "symbols the strategy performed best on.")
 
+    # Load a saved watchlist straight into the bucket — the SAME watchlists the
+    # live sidebar uses, so a set saved here is ready to trade live and vice-versa.
+    def _apply_bulk_watchlist() -> None:
+        name = st.session_state.get("bt_bulk_watchlist_pick", _WL_NONE)
+        if not name or name == _WL_NONE:
+            return
+        st.session_state["bt_bulk_symbols"] = [
+            s for s in watchlists.get(name) if s in config.INSTRUMENTS_BY_SYMBOL]
+
+    _wl_names_bt = watchlists.names()
+    wc1, wc2 = st.columns([2, 1])
+    wc1.selectbox(
+        "📋 Load a watchlist into the bucket", [_WL_NONE] + _wl_names_bt,
+        key="bt_bulk_watchlist_pick", on_change=_apply_bulk_watchlist,
+        help="Watchlists are shared with the live bot's sidebar.")
+
     bulk_symbols = st.multiselect(
         "Bucket — instruments to test together",
         [i.symbol for i in ALL_INSTRUMENTS],
         key="bt_bulk_symbols",
         help="All use the Mode, Strategy, capital and date range selected above.")
+
+    # Save the current bucket as a watchlist so it can be reused here or live.
+    sc1, sc2 = st.columns([2, 1])
+    _bt_wl_new = sc1.text_input(
+        "Save this bucket as a watchlist", key="bt_wl_new_name",
+        placeholder="e.g. Swing Winners")
+    if sc2.button("💾 Save bucket", key="bt_wl_save", use_container_width=True):
+        if watchlists.save(_bt_wl_new, st.session_state.get("bt_bulk_symbols", [])):
+            st.success(f"Saved '{_bt_wl_new.strip()}' "
+                       f"({len(st.session_state.get('bt_bulk_symbols', []))} symbols).")
+            st.rerun()
+        else:
+            st.error("Enter a name and add at least one instrument to the bucket.")
     norm_bulk = st.checkbox(
         "Normalise curves to % return (start all at 0%)", value=True,
         key="bt_bulk_norm",
